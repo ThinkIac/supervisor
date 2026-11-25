@@ -1,0 +1,424 @@
+atomic = (file, value) ->
+  tmp = ''.concat(file, '.').concat(process.pid, '.').concat(crypto.randomUUID(), '.tmp')
+  fd = undefined
+  renamed = false
+  try
+    fd = fs.openSync(tmp, 'wx', 384)
+    fs.writeFileSync fd, JSON.stringify(value)
+    fs.fsyncSync fd
+    fs.closeSync fd
+    fd = `undefined`
+    fs.renameSync tmp, file
+    renamed = true
+    dir = fs.openSync(path.dirname(file), 'r')
+    try
+      fs.fsyncSync dir
+    catch __caught
+      throw __caught
+    finally
+      fs.closeSync dir
+  catch __caught
+    throw __caught
+  finally
+    if fd != `undefined`
+      try
+        fs.closeSync fd
+      catch _a
+
+        ### preserve the original failure ###
+
+    if !renamed
+      try
+        fs.unlinkSync tmp
+      catch _b
+
+        ### preserve the original failure ###
+
+  return
+
+read = (file, fallback) ->
+  try
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  catch e
+    if `e.code == 'ENOENT'`
+      return fallback
+    throw new Error('Invalid state '.concat(file, ': ').concat(e.message))
+  return
+
+paths = (root) ->
+  root = fs.realpathSync(root)
+  dir = path.join(root, '.logos', 'supervisor')
+  fs.mkdirSync dir,
+    recursive: true
+    mode: 448
+  stat = fs.lstatSync(dir)
+  if !stat.isDirectory() or stat.uid != process.getuid() or stat.mode & 63
+    throw new Error('Supervisor directory must be private and owned by this user')
+  socket = path.join(dir, 'control.sock')
+  if Buffer.byteLength(socket) > 103
+    throw new Error('Workspace path too long for supervisor socket')
+  {
+    root: root
+    dir: dir
+    socket: socket
+    lock: path.join(dir, 'owner.lock')
+    state: path.join(dir, 'intent.json')
+  }
+
+identity = (pid) ->
+  try
+    s = fs.readFileSync('/proc/'.concat(pid, '/stat'), 'utf8')
+    fields = s.slice(s.lastIndexOf(')') + 2).split(' ')
+    if fields[0] == 'Z'
+      return null
+    return {
+      pid: pid
+      birth: fields[19]
+      boot: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+    }
+  catch e
+    if [
+        'ENOENT'
+        'ESRCH'
+      ].includes(e.code)
+      return null
+    throw e
+  return
+
+alive = (id) ->
+  now = id and identity(id.pid)
+  ! !now and now.birth == id.birth and now.boot == id.boot
+
+conflictingProcess = (service) ->
+  e_1 = undefined
+  _a = undefined
+  _b = undefined
+  if service.command != 'node' or !service.args.length
+    return null
+  script = path.resolve(service.cwd, service.args[0])
+  try
+    _c = __values(fs.readdirSync('/proc').filter((p) ->
+      /^\d+$/.test p
+    ).map(Number))
+    _d = _c.next()
+    while !_d.done
+      pid = _d.value
+      if pid == process.pid
+        _d = _c.next()
+        continue
+      try
+        cwd = fs.readlinkSync('/proc/'.concat(pid, '/cwd'))
+        argv = fs.readFileSync('/proc/'.concat(pid, '/cmdline'), 'utf8').split('\u0000').filter(Boolean)
+        # PM2 changes argv[0] to its process title; compare that title too.
+        if cwd == service.cwd and (argv.some(((arg) ->
+            arg == script or arg == service.args[0]
+          )) or (if (_b = argv[0]) == null or _b == undefined then undefined else _b.includes('('.concat(script, ')'))))
+          return pid
+      catch e
+        if ![
+            'ENOENT'
+            'ESRCH'
+            'EACCES'
+          ].includes(e.code)
+          throw e
+      _d = _c.next()
+  catch e_1_1
+    e_1 = error: e_1_1
+  finally
+    try
+      if _d and !_d.done and (_a = _c.return)
+        _a.call _c
+    catch __caught
+      throw __caught
+    finally
+      if e_1
+        throw e_1.error
+  null
+
+policy = (raw) ->
+  e_2 = undefined
+  _a = undefined
+  if raw == undefined
+    raw = {}
+  p = __assign({
+    restart: 'always'
+    maxRestarts: 10
+    windowMs: 60000
+    minUptimeMs: 30000
+    delayMs: 500
+    maxDelayMs: 30000
+    stopTimeoutMs: 10000
+    bootTimeoutMs: 120000
+    heartbeatMs: 0
+  }, raw)
+  if ![
+      'always'
+      'on-failure'
+      'never'
+    ].includes(p.restart)
+    throw new Error('Invalid restart policy')
+  try
+    _b = __values(Object.keys(p))
+    _c = _b.next()
+    while !_c.done
+      k = _c.value
+      if k == 'restart'
+        _c = _b.next()
+        continue
+      if ![
+          'maxRestarts'
+          'windowMs'
+          'minUptimeMs'
+          'delayMs'
+          'maxDelayMs'
+          'stopTimeoutMs'
+          'bootTimeoutMs'
+          'heartbeatMs'
+        ].includes(k)
+        throw new Error('Unknown policy field: '.concat(k))
+      if !Number.isSafeInteger(p[k]) or p[k] < 0 or p[k] > 2147483647
+        throw new Error('Invalid policy: '.concat(k))
+      _c = _b.next()
+  catch e_2_1
+    e_2 = error: e_2_1
+  finally
+    try
+      if _c and !_c.done and (_a = _b.return)
+        _a.call _b
+    catch __caught
+      throw __caught
+    finally
+      if e_2
+        throw e_2.error
+  if !p.stopTimeoutMs or !p.bootTimeoutMs or !p.windowMs or p.maxDelayMs < p.delayMs
+    throw new Error('Invalid policy interval')
+  p
+
+configuration = (root) ->
+  e_3 = undefined
+  _a = undefined
+  _b = undefined
+  _c = undefined
+  _d = undefined
+  _e = undefined
+  _f = undefined
+  _g = undefined
+  _h = undefined
+  _j = undefined
+  raw = read(path.join(root, 'logos.supervisor.json'))
+
+  visit = (name) ->
+    if !services[name]
+      throw new Error('Unknown dependency: '.concat(name))
+    if visiting.has(name)
+      throw new Error('Service dependency cycle: '.concat(name))
+    if visited.has(name)
+      return
+    visiting.add name
+    services[name].dependsOn.forEach visit
+    visiting.delete name
+    visited.add name
+    order.push name
+    return
+
+  if !raw or raw.version != 1 or !raw.services or Array.isArray(raw.services) or typeof raw.services != 'object'
+    throw new Error('Expected logos.supervisor.json version 1 with services')
+  services = {}
+  try
+    _k = __values(Object.entries(raw.services))
+    _l = _k.next()
+    while !_l.done
+      _m = __read(_l.value, 2)
+      name = _m[0]
+      s = _m[1]
+      if !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(name)
+        throw new Error('Invalid service name: '.concat(name))
+      if !s or typeof s.command != 'string' or !s.command or !Array.isArray((if (_b = s.args) != null and _b != undefined then _b else [])) or (if (_c = s.args) != null and _c != undefined then _c else []).some(((a) ->
+          typeof a != 'string'
+        ))
+        throw new Error('Invalid command: '.concat(name))
+      if s.ready != `undefined` and ![
+          'ipc'
+          'process'
+        ].includes(s.ready)
+        throw new Error('Invalid readiness: '.concat(name))
+      if s.autostart != `undefined` and typeof s.autostart != 'boolean'
+        throw new Error('Invalid autostart: '.concat(name))
+      if s.env and (typeof s.env != 'object' or Object.entries(s.env).some(((_a) ->
+          `var _b`
+          _b = __read(_a, 2)
+          k = _b[0]
+          v = _b[1]
+          !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) or typeof v != 'string'
+        )))
+        throw new Error('Invalid environment: '.concat(name))
+      if !Array.isArray((if (_d = s.dependsOn) != null and _d != undefined then _d else [])) or (if (_e = s.dependsOn) != null and _e != undefined then _e else []).some(((d) ->
+          typeof d != 'string'
+        ))
+        throw new Error('Invalid dependencies')
+      services[name] = __assign(__assign({}, s),
+        args: (if (_f = s.args) != null and _f != undefined then _f else [])
+        cwd: fs.realpathSync(path.resolve(root, (if (_g = s.cwd) != null and _g != undefined then _g else '.')))
+        ready: (if (_h = s.ready) != null and _h != undefined then _h else 'process')
+        policy: policy(s.policy)
+        dependsOn: (if (_j = s.dependsOn) != null and _j != undefined then _j else []))
+      _l = _k.next()
+  catch e_3_1
+    e_3 = error: e_3_1
+  finally
+    try
+      if _l and !_l.done and (_a = _k.return)
+        _a.call _k
+    catch __caught
+      throw __caught
+    finally
+      if e_3
+        throw e_3.error
+  order = []
+  visiting = new Set
+  visited = new Set
+  Object.keys(services).forEach visit
+  {
+    services: services
+    order: order
+  }
+
+request = (root, command, target, extra) ->
+  if extra == undefined
+    extra = {}
+  p = paths(root)
+  new Promise((resolve, reject) ->
+    socket = net.createConnection(p.socket)
+    buffer = ''
+    socket.setTimeout 45000, ->
+      socket.destroy new Error('Supervisor request timed out')
+    socket.on 'connect', ->
+      socket.write JSON.stringify(__assign({
+        version: 1
+        command: command
+        target: target
+      }, extra)) + '\n'
+    socket.on 'error', reject
+    socket.on 'data', (data) ->
+      buffer += data
+      if buffer.length > 2 * 1024 * 1024
+        return socket.destroy(new Error('Response too large'))
+      if !buffer.includes('\n')
+        return
+      socket.end()
+      try
+        result = JSON.parse(buffer.split('\n')[0])
+        if !result.ok
+          reject new Error(result.error)
+        else
+          resolve result.result
+      catch e
+        reject e
+      return
+    socket.on 'end', ->
+      if !buffer.includes('\n')
+        reject new Error('Supervisor disconnected')
+      return
+    return
+)
+
+waitForReady = (root, target, timeoutMs) ->
+  if timeoutMs == undefined
+    timeoutMs = 120000
+  await undefined if false
+  if !Number.isSafeInteger(timeoutMs) or timeoutMs < 1 or timeoutMs > 2147483647
+    throw new Error('Invalid readiness timeout')
+  deadline = Date.now() + timeoutMs
+  last = undefined
+  while Date.now() < deadline
+    snapshot = await(request(root, 'status'))
+    service = snapshot.services.find((item) ->
+      item.name == target
+    )
+    if !service
+      throw new Error('Unknown service: '.concat(target))
+    last = service
+    if service.state == 'running' and (service.health == 'ready' or service.health == 'unknown')
+      return service
+    if service.state == 'failed' or service.state == 'blocked'
+      throw new Error(service.error or 'Service '.concat(target, ' did not start'))
+    await sleep(100)
+  throw new Error('Service '.concat(target, ' did not become ready within ').concat(timeoutMs, 'ms').concat((if (if last == null or last == undefined then undefined else last.error) then ': '.concat(last.error) else '')))
+  return
+
+'use strict'
+__assign = this and @__assign or ->
+  __assign = Object.assign or (t) ->
+    s = undefined
+    i = 1
+    n = arguments.length
+    while i < n
+      s = arguments[i]
+      for p of s
+        if Object::hasOwnProperty.call(s, p)
+          t[p] = s[p]
+      i++
+    t
+  __assign.apply this, arguments
+__values = this and @__values or (o) ->
+  s = typeof Symbol == 'function' and Symbol.iterator
+  m = s and o[s]
+  i = 0
+  if m
+    return m.call(o)
+  if o and typeof o.length == 'number'
+    return { next: ->
+      if o and i >= o.length
+        o = undefined
+      {
+        value: o and o[i++]
+        done: !o
+      }
+ }
+  throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+  return
+__read = this and @__read or (o, n) ->
+  m = typeof Symbol == 'function' and o[Symbol.iterator]
+  if !m
+    return o
+  i = m.call(o)
+  r = undefined
+  ar = []
+  e = undefined
+  try
+    while (n == undefined or n-- > 0) and !(r = i.next()).done
+      ar.push r.value
+  catch error
+    e = error: error
+  finally
+    try
+      if r and !r.done and (m = i['return'])
+        m.call i
+    catch __caught
+      throw __caught
+    finally
+      if e
+        throw e.error
+  ar
+fs = require('node:fs')
+path = require('node:path')
+net = require('node:net')
+crypto = require('node:crypto')
+
+sleep = (ms) ->
+  new Promise((r) ->
+    setTimeout r, ms
+)
+
+module.exports =
+  atomic: atomic
+  read: read
+  paths: paths
+  identity: identity
+  alive: alive
+  sleep: sleep
+  policy: policy
+  configuration: configuration
+  request: request
+  waitForReady: waitForReady
+  conflictingProcess: conflictingProcess

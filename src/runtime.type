@@ -1,0 +1,435 @@
+###* Public LogosModule contract; lifecycle operations are supplied by the host. ###
+
+createRuntimeModule = (_a) ->
+  _b = (if `_a == void 0` then {} else _a)
+  recoverIsolatedPackage = _b.recoverIsolatedPackage
+  root = _b.root
+  activeController = null
+  {
+    name: 'supervisor'
+    phase: 'boot'
+    swappable: false
+    close: ->
+      (if `activeController == null` or `activeController == void 0` then undefined else activeController.close())
+      return
+    install: (container) ->
+      dir = path.join(container.workspace, '.logos', 'supervisor')
+
+      bootBlock = (pkg, visiting) ->
+        `var _a`
+        `var _b`
+        e_1 = undefined
+        _a = undefined
+        _b = undefined
+        if `visiting == void 0`
+          visiting = new Set
+        if !wantsRunning(pkg.folder)
+          return 'stopped'
+        if visiting.has(pkg.folder)
+          return 'Dependency cycle'
+        visiting.add pkg.folder
+
+        _loop_1 = (name) ->
+          if name.endsWith('?')
+            return 'continue'
+          dependency = container.registry.discover().find((p) ->
+            `p.name == name` or `p.folder == name` or `p.folder == name.replace(/^@[^/]+\//, '')`
+          )
+          if dependency and bootBlock(dependency, new Set(visiting))
+            return { value: 'Dependency stopped: '.concat(name) }
+          return
+
+        try
+          _c = __values(Object.keys((if `(_b = pkg.logosDependencies) != null` and `_b != void 0` then _b else {})))
+          _d = _c.next()
+          while !_d.done
+            name = _d.value
+            state_1 = _loop_1(name)
+            if `typeof state_1 == 'object'`
+              return state_1.value
+            _d = _c.next()
+        catch e_1_1
+          e_1 = error: e_1_1
+        finally
+          try
+            if _d and !_d.done and (_a = _c.return)
+              _a.call _c
+          catch __caught
+            throw __caught
+          finally
+            if e_1
+              throw e_1.error
+        null
+
+      cancel = (folder) ->
+        clearTimeout timers.get(folder)
+        timers.delete folder
+        return
+
+      schedule = (folder, recover, exit) ->
+        `var _a`
+        `var _b`
+        _a = undefined
+        _b = undefined
+        await undefined if false
+        if !wantsRunning(folder) or timers.has(folder)
+          return
+        pkg = container.registry.getPackage(folder)
+        r = get(folder)
+        p = policy((if `(_b = (_a = pkg === null || pkg === void 0 ? void 0 : pkg.runtime) === null || _a === void 0 ? void 0 : _a.supervision) != null` and `_b != void 0` then _b else {}))
+        if `p.restart == 'never'` or `p.restart == 'on-failure'` and `(exit === null || exit === void 0 ? void 0 : exit.code) == 0` and !(if `exit == null` or `exit == void 0` then undefined else exit.signal)
+          r.state = 'failed'
+          return
+        now = Date.now()
+        r.failures = (if r.readyAt and now - (r.readyAt) >= p.minUptimeMs then [] else r.failures.filter(((t) ->
+          now - t < p.windowMs
+        )))
+        if r.failures.length >= p.maxRestarts
+          r.state = 'failed'
+          r.error = 'Restart limit reached'
+          return
+        r.failures.push now
+        r.restarts++
+        r.state = 'backoff'
+        r.health = 'unhealthy'
+        wait = Math.min(p.maxDelayMs, p.delayMs * 2 ** Math.min(r.failures.length - 1, 30))
+        timers.set folder, setTimeout((->
+          `var _a`
+          `var _b`
+          _a = undefined
+          _b = undefined
+          await undefined if false
+          timers.delete folder
+          if !wantsRunning(folder)
+            return
+          try
+            r.state = 'starting'
+            result = await(recover())
+            if `(result === null || result === void 0 ? void 0 : result.ok) == false`
+              throw new Error((if `(_a = result.error) != null` and `_a != void 0` then _a else 'Recovery rejected'))
+            if !wantsRunning(folder)
+              return
+            r.state = 'running'
+            r.health = (if `(_b = result === null || result === void 0 ? void 0 : result.health) != null` and `_b != void 0` then _b else 'ready')
+            r.readyAt = Date.now()
+            r.error = null
+          catch e
+            r.error = e.message
+            await schedule(folder, recover)
+          return
+        ), wait)
+        return
+
+      fs.mkdirSync dir,
+        recursive: true
+        mode: 448
+      file = path.join(dir, 'packages.json')
+      intent = read(file,
+        version: 1
+        packages: {})
+      if `(intent === null || intent === void 0 ? void 0 : intent.version) != 1` or !intent.packages or Object.values(intent.packages).some(((x) ->
+          ![
+            'running'
+            'stopped'
+          ].includes(x)
+        ))
+        throw new Error('Invalid package supervisor intent')
+      records = new Map
+      timers = new Map
+      closed = false
+
+      wantsRunning = (folder) ->
+        !closed and `intent.packages[folder] != 'stopped'`
+
+      get = (folder) ->
+        `var _a`
+        _a = undefined
+        if !records.has(folder)
+          records.set folder,
+            desired: (if `(_a = intent.packages[folder]) != null` and `_a != void 0` then _a else 'running')
+            restarts: 0
+            failures: []
+            state: 'running'
+            health: 'unknown'
+            error: null
+        records.get folder
+
+      controller = 
+        wantsRunning: wantsRunning
+        bootBlock: bootBlock
+        beforeStop: (folder) ->
+          `var _a`
+          _a = undefined
+          await undefined if false
+          if !container.registry.getPackage(folder)
+            throw new Error('Unknown package: '.concat(folder))
+          next = __assign(__assign({}, intent), packages: __assign(__assign({}, intent.packages), (->
+            _a = {}
+            _a[folder] = 'stopped'
+            _a
+          ).call(this)))
+          atomic file, next
+          intent.packages = next.packages
+          cancel folder
+          Object.assign get(folder),
+            desired: 'stopped'
+            state: 'stopped'
+            health: 'unknown'
+          return
+        beforeStart: (folder) ->
+          await undefined if false
+          pkg = container.registry.getPackage(folder)
+          if !pkg
+            throw new Error('Unknown package: '.concat(folder))
+          old = intent.packages[folder]
+          intent.packages[folder] = 'running'
+          blocked = bootBlock(pkg)
+          if blocked
+            if `old == undefined`
+              delete intent.packages[folder]
+            else
+              intent.packages[folder] = old
+            throw new Error(blocked)
+          try
+            atomic file, intent
+          catch error
+            if `old == undefined`
+              delete intent.packages[folder]
+            else
+              intent.packages[folder] = old
+            throw error
+          cancel folder
+          Object.assign get(folder),
+            desired: 'running'
+            failures: []
+            state: 'starting'
+          return
+        snapshot: (folder) ->
+          `var _a`
+          `var _b`
+          _a = undefined
+          _b = undefined
+          _c = undefined
+          r = get(folder)
+          runner = container.state('isolated').get(folder)
+          proc = container.state('proc').get(folder)
+          observed = (if `(_a = container.registry.getState(folder)) == null` or `_a == void 0` then undefined else _a.state)
+          state = (if [
+            'backoff'
+            'failed'
+          ].includes(r.state) then r.state else (if `observed == 'active'` then 'running' else (if `observed != null` and `observed != void 0` then observed else r.state)))
+          {
+            desired: r.desired
+            state: state
+            health: (if (if `runner == null` or `runner == void 0` then undefined else runner.running) then 'ready' else r.health)
+            restarts: r.restarts
+            error: r.error
+            pid: (if `(_c = (_b = runner === null || runner === void 0 ? void 0 : runner.pid) !== null && _b !== void 0 ? _b : proc === null || proc === void 0 ? void 0 : proc.pid) != null` and `_c != void 0` then _c else null)
+            owner: (if proc then 'proc' else (if runner then 'isolated' else 'runtime'))
+          }
+        scheduleProc: (folder, recover, exit) ->
+          schedule folder, recover, exit
+        cancel: cancel
+        external: ->
+          await undefined if false
+          if !process.env.LOGOS_SUPERVISOR_ROOT and !root
+            return { available: false }
+          try
+            return __assign({ available: true }, await(request((if `root != null` and `root != void 0` then root else process.env.LOGOS_SUPERVISOR_ROOT), 'status')))
+          catch e
+            return {
+              available: false
+              error: e.message
+            }
+          return
+        close: ->
+          `var _a`
+          `var _b`
+          e_2 = undefined
+          _a = undefined
+          closed = true
+          try
+            _b = __values(timers.keys())
+            _c = _b.next()
+            while !_c.done
+              folder = _c.value
+              cancel folder
+              _c = _b.next()
+          catch e_2_1
+            e_2 = error: e_2_1
+          finally
+            try
+              if _c and !_c.done and (_a = _b.return)
+                _a.call _b
+            catch __caught
+              throw __caught
+            finally
+              if e_2
+                throw e_2.error
+          return
+      container.state('supervisor').set 'controller', controller
+      activeController = controller
+      container.bus.on 'isolated:exit', ((event) ->
+        `var _a`
+        `var _b`
+        _a = undefined
+        _b = undefined
+        _c = undefined
+        _d = undefined
+        await undefined if false
+        if event.expected or !wantsRunning(event.pkg)
+          return
+        r = get(event.pkg)
+        r.error = 'Exit '.concat((if `(_a = event.code) != null` and `_a != void 0` then _a else event.signal))
+        r.health = 'unhealthy'
+        container.registry.setState event.pkg, 'failed', r.error
+        p = policy((if `(_d = (_c = (_b = container.registry.getPackage(event.pkg)) === null || _b === void 0 ? void 0 : _b.runtime) === null || _c === void 0 ? void 0 : _c.supervision) != null` and `_d != void 0` then _d else {}))
+        if `p.restart == 'on-failure'` and `event.code == 0` and !event.signal
+          r.state = 'stopped'
+          return
+        await schedule(event.pkg, ->
+          recoverIsolatedPackage container, event.pkg
+        )
+        return
+      ), owner: 'system'
+      container.bus.on 'reload:swapped', ((event) ->
+        r = get(event.pkg)
+        if wantsRunning(event.pkg)
+          Object.assign r,
+            state: 'running'
+            readyAt: Date.now()
+            error: null
+        return
+      ), owner: 'system'
+      container.bus.on 'shutdown', (->
+        controller.close()
+      ),
+        owner: 'system'
+        priority: -1000
+      container.bus.on 'logos:stopping', (->
+        controller.close()
+      ),
+        owner: 'system'
+        priority: -1000
+      return
+
+  }
+
+notifyReady = ->
+  if !process.env.LOGOS_SUPERVISOR_SERVICE or !process.send
+    return ->
+
+  send = (type) ->
+    if process.connected
+      process.send { type: type }, ->
+    return
+
+  send 'logos:ready'
+  timer = setInterval((->
+    send 'logos:heartbeat'
+  ), 1000)
+  timer.unref()
+  ->
+    clearInterval timer
+
+###* Supervisor registration is ordinary package data; recovery is a host port. ###
+
+provideSupervisor = (host) ->
+
+  ###*
+  # @register module supervisor
+  # @context capability
+  ###
+
+  createRuntimeModule
+    root: host.applicationRoot()
+    recoverIsolatedPackage: (_container, folder) ->
+      host.process.recoverIsolatedPackage folder
+
+'use strict'
+__assign = this and @__assign or ->
+  __assign = Object.assign or (t) ->
+    s = undefined
+    i = 1
+    n = arguments.length
+    while i < n
+      s = arguments[i]
+      for p of s
+        if Object::hasOwnProperty.call(s, p)
+          t[p] = s[p]
+      i++
+    t
+  __assign.apply this, arguments
+__values = this and @__values or (o) ->
+  s = `typeof Symbol == 'function'` and Symbol.iterator
+  m = s and o[s]
+  i = 0
+  if m
+    return m.call(o)
+  if o and `typeof o.length == 'number'`
+    return { next: ->
+      if o and i >= o.length
+        o = undefined
+      {
+        value: o and o[i++]
+        done: !o
+      }
+ }
+  throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+  return
+__read = this and @__read or (o, n) ->
+  m = `typeof Symbol == 'function'` and o[Symbol.iterator]
+  if !m
+    return o
+  i = m.call(o)
+  r = undefined
+  ar = []
+  e = undefined
+  try
+    while (`n == void 0` or n-- > 0) and !(r = i.next()).done
+      ar.push r.value
+  catch error
+    e = error: error
+  finally
+    try
+      if r and !r.done and (m = i['return'])
+        m.call i
+    catch __caught
+      throw __caught
+    finally
+      if e
+        throw e.error
+  ar
+__spreadArray = this and @__spreadArray or (to, from, pack) ->
+  if pack or `arguments.length == 2`
+    i = 0
+    l = from.length
+    ar = undefined
+    while i < l
+      if ar or !(i of from)
+        if !ar
+          ar = Array::slice.call(from, 0, i)
+        ar[i] = from[i]
+      i++
+  to.concat ar or Array::slice.call(from)
+fs = require('node:fs')
+path = require('node:path')
+_a = require('./common.cjs')
+atomic = _a.atomic
+read = _a.read
+policy = _a.policy
+request = _a.request
+module.exports =
+  provideSupervisor: provideSupervisor
+  createRuntimeModule: createRuntimeModule
+  notifyReady: notifyReady
+
+module.exports.createHost = ->
+  `var _a`
+  _a = undefined
+  args = []
+  _i = 0
+  while _i < arguments.length
+    args[_i] = arguments[_i]
+    _i++
+  (_a = require('@thinkiac/module-runtime-compat')).createHost.apply _a, __spreadArray([], __read(args), false)

@@ -1,0 +1,48 @@
+{
+  "name": "@logos/supervisor",
+  "version": "0.1.0",
+  "description": "Workspace and isolated package supervision for Logos",
+  "main": "index.cjs",
+  "bin": {
+    "logos-supervisor": "cli.cjs"
+  },
+  "files": [
+    "*.cjs",
+    "*.js",
+    "transport",
+    "compat",
+    "runtime",
+    "src",
+    "dist",
+    "scripts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "registry": "https://npm.thinkiac.cloud",
+    "access": "public"
+  },
+  "license": "MIT",
+  "runtime": {
+    "entry": "runtime.cjs"
+  },
+  "dependencies": {
+    "@thinkiac/module-runtime-compat": "git+https://github.com/ThinkIac/runtime-compat.git#cdc7111e66614bb1ed4a80901b3363587b3e6f0a"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThinkIac/supervisor.git"
+  },
+  "devDependencies": {
+    "logostype": "git+https://github.com/ThinkIac/LogosType.git#acdcc6032ab94219e0d4a4d25b1538fb55fa19cf"
+  }
+}

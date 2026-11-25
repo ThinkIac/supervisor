@@ -1,0 +1,743 @@
+memory = (pid) ->
+  if !pid
+    return null
+  try
+    status = fs.readFileSync('/proc/'.concat(pid, '/status'), 'utf8')
+    rss = status.match(/^VmRSS:\s+(\d+) kB/m)
+    return (if rss then rssBytes: Number(rss[1]) * 1024 else null)
+  catch _a
+    return null
+  return
+
+'use strict'
+fs = require('node:fs')
+path = require('node:path')
+net = require('node:net')
+fork = require('node:child_process').fork
+_a = require('./common.cjs')
+atomic = _a.atomic
+read = _a.read
+paths = _a.paths
+configuration = _a.configuration
+identity = _a.identity
+alive = _a.alive
+sleep = _a.sleep
+request = _a.request
+conflictingProcess = _a.conflictingProcess
+class Supervisor
+  constructor: (root) ->
+    __values = (o) ->
+      s = typeof Symbol == 'function' and Symbol.iterator
+      m = s and o[s]
+      i = 0
+      if m
+        return m.call(o)
+      if o and typeof o.length == 'number'
+        return { next: ->
+          if o and i >= o.length
+            o = undefined
+          {
+            value: o and o[i++]
+            done: !o
+          }
+     }
+      throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+      return
+    e_1 = undefined
+    _a = undefined
+    _b = undefined
+    _c = undefined
+    _d = undefined
+    @paths = paths(root)
+    @config = configuration(@paths.root)
+    @intent = read(@paths.state,
+      version: 1
+      services: {})
+    if (if (_b = @intent) == null or _b == undefined then undefined else _b.version) != 1 or !@intent.services or Object.values(@intent.services).some(((v) ->
+        ![
+          'running'
+          'stopped'
+        ].includes(v)
+      ))
+      throw new Error('Invalid supervisor intent; restore a valid snapshot before starting')
+    @states = new Map
+    @closing = false
+    @queue = Promise.resolve()
+    @sockets = new Set
+    try
+      _e = __values(@config.order)
+      _f = _e.next()
+      while !_f.done
+        name = _f.value
+        (if (_c = (_d = @intent.services)[name]) != null and _c != undefined then _c else (_d[name] = (if @config.services[name].autostart == false then 'stopped' else 'running')))
+        @states.set name,
+          name: name
+          state: 'stopped'
+          health: 'unknown'
+          generation: 0
+          restarts: 0
+          failures: []
+          pid: null
+          startedAt: null
+          lastExit: null
+          error: null
+        _f = _e.next()
+    catch e_1_1
+      e_1 = error: e_1_1
+    finally
+      try
+        if _f and !_f.done and (_a = _e.return)
+          _a.call _e
+      catch __caught
+        throw __caught
+      finally
+        if e_1
+          throw e_1.error
+    return
+  persist: ->
+    atomic @paths.state, @intent
+    return
+  serialize: (fn) ->
+    next = @queue.catch(->
+    ).then(fn)
+    @queue = next
+    next
+  snapshot: ->
+    __read = (o, n) ->
+      m = typeof Symbol == 'function' and o[Symbol.iterator]
+      if !m
+        return o
+      i = m.call(o)
+      r = undefined
+      ar = []
+      e = undefined
+      try
+        while (n == undefined or n-- > 0) and !(r = i.next()).done
+          ar.push r.value
+      catch error
+        e = error: error
+      finally
+        try
+          if r and !r.done and (m = i['return'])
+            m.call i
+        catch __caught
+          throw __caught
+        finally
+          if e
+            throw e.error
+      ar
+    __spreadArray = (to, from, pack) ->
+      if pack or arguments.length == 2
+        i = 0
+        l = from.length
+        ar = undefined
+        while i < l
+          if ar or !(i of from)
+            if !ar
+              ar = Array::slice.call(from, 0, i)
+            ar[i] = from[i]
+          i++
+      to.concat ar or Array::slice.call(from)
+    _this = this
+    {
+      version: 1
+      pid: process.pid
+      root: @paths.root
+      services: __spreadArray([], __read(@states.values()), false).map((s) ->
+        _a = undefined
+        {
+          name: s.name
+          desired: _this.intent.services[s.name]
+          state: s.state
+          health: s.health
+          pid: s.pid
+          generation: s.generation
+          restarts: s.restarts
+          startedAt: s.startedAt
+          lastExit: s.lastExit
+          error: s.error
+          logError: (if (_a = s.logError) != null and _a != undefined then _a else null)
+          memory: memory(s.pid)
+          uptimeMs: (if s.pid then Date.now() - (s.startedAt) else 0)
+        }
+      )
+    }
+  log: (name, text) ->
+    _a = undefined
+    file = path.join(@paths.dir, ''.concat(name, '.log'))
+    try
+      # Three files, at most 1 MiB each, without an unbounded write queue.
+      chunk = Buffer.from(text).subarray(0, 32768)
+      if (if fs.existsSync(file) then fs.statSync(file).size else 0) + chunk.length > 1024 * 1024
+        i = 2
+        while i >= 1
+          src = (if i == 1 then file else ''.concat(file, '.').concat(i - 1))
+          if fs.existsSync(src)
+            fs.renameSync src, ''.concat(file, '.').concat(i)
+          i--
+      fs.appendFileSync file, chunk, mode: 384
+    catch e
+      @states.get(name).logError = (if `(_a = e.code) != null` and `_a != undefined` then _a else e.message)
+    return
+  event: (s, event, detail) ->
+    __assign = ->
+      __assign = Object.assign or (t) ->
+        s = undefined
+        i = 1
+        n = arguments.length
+        while i < n
+          s = arguments[i]
+          for p of s
+            if Object::hasOwnProperty.call(s, p)
+              t[p] = s[p]
+          i++
+        t
+      __assign.apply this, arguments
+    if detail == undefined
+      detail = {}
+    @log s.name, JSON.stringify(__assign({
+      version: 1
+      at: (new Date).toISOString()
+      event: event
+      name: s.name
+      generation: s.generation
+    }, detail)) + '\n'
+    return
+  recoverOrphans: ->
+    __values = (o) ->
+      s = typeof Symbol == 'function' and Symbol.iterator
+      m = s and o[s]
+      i = 0
+      if m
+        return m.call(o)
+      if o and typeof o.length == 'number'
+        return { next: ->
+          if o and i >= o.length
+            o = undefined
+          {
+            value: o and o[i++]
+            done: !o
+          }
+     }
+      throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+      return
+    e_1 = undefined
+    _a = undefined
+    await undefined if false
+    try
+      _b = __values(fs.readdirSync(@paths.dir).filter((f) ->
+        f.endsWith '.owner.json'
+      ))
+      _c = _b.next()
+      while !_c.done
+        file = _c.value
+        record = path.join(@paths.dir, file)
+        owner = read(record)
+        if alive(owner.guardian)
+          process.kill owner.guardian.pid, 'SIGTERM'
+          deadline = Date.now() + 35000
+          while alive(owner.guardian) and Date.now() < deadline
+            await sleep(25)
+          if alive(owner.guardian)
+            throw new Error('Previous guardian did not stop: '.concat(file))
+        # Birth time + boot ID prevent signaling a recycled PID.
+        if alive(owner.child)
+          process.kill -owner.child.pid, 'SIGKILL'
+          i = 0
+          while i < 100 and alive(owner.child)
+            await sleep(20)
+            i++
+          if alive(owner.child)
+            throw new Error('Previous service did not stop: '.concat(file))
+        try
+          fs.unlinkSync record
+        catch e
+          if `e.code != 'ENOENT'`
+            throw e
+        _c = _b.next()
+    catch e_1_1
+      e_1 = error: e_1_1
+    finally
+      try
+        if _c and !_c.done and (_a = _b.return)
+          _a.call _b
+      catch __caught
+        throw __caught
+      finally
+        if e_1
+          throw e_1.error
+    return
+  listen: ->
+    __values = (o) ->
+      s = typeof Symbol == 'function' and Symbol.iterator
+      m = s and o[s]
+      i = 0
+      if m
+        return m.call(o)
+      if o and typeof o.length == 'number'
+        return { next: ->
+          if o and i >= o.length
+            o = undefined
+          {
+            value: o and o[i++]
+            done: !o
+          }
+     }
+      throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+      return
+    e_1 = undefined
+    _a = undefined
+    _this = this
+    await undefined if false
+    # Caller must hold the OS flock for the entire daemon lifetime.
+    await @recoverOrphans()
+    @persist()
+    try
+      fs.unlinkSync @paths.socket
+    catch e
+      if `e.code != 'ENOENT'`
+        throw e
+    @server = net.createServer((socket) ->
+      _this.sockets.add socket
+      socket.once 'close', ->
+        _this.sockets.delete socket
+      socket.on 'error', ->
+      socket.setTimeout 5000, ->
+        socket.destroy()
+      data = ''
+      handled = false
+      socket.on 'data', (bytes) ->
+        if handled
+          return
+        data += bytes
+        if data.length > 8192
+          return socket.destroy()
+        if !data.includes('\n')
+          return
+        handled = true
+        socket.setTimeout 60000, ->
+          socket.destroy()
+        msg = undefined
+        try
+          msg = JSON.parse(data.split('\n')[0])
+        catch _a
+          return socket.end('{"ok":false,"error":"Invalid JSON"}\n')
+        _this.serialize(->
+          _this.command msg
+        ).then ((result) ->
+          socket.end JSON.stringify(
+            ok: true
+            result: result) + '\n'
+        ), (e) ->
+          socket.end JSON.stringify(
+            ok: false
+            error: e.message) + '\n'
+        return
+      return
+    )
+    await new Promise((resolve, reject) ->
+      _this.server.once 'error', reject
+      _this.server.listen _this.paths.socket, resolve
+      return
+  )
+    fs.chmodSync @paths.socket, 384
+    try
+      _b = __values(@config.order)
+      _c = _b.next()
+      while !_c.done
+        name = _c.value
+        @launch name
+        _c = _b.next()
+    catch e_1_1
+      e_1 = error: e_1_1
+    finally
+      try
+        if _c and !_c.done and (_a = _b.return)
+          _a.call _b
+      catch __caught
+        throw __caught
+      finally
+        if e_1
+          throw e_1.error
+    return
+  launch: (name) ->
+    __assign = ->
+      __assign = Object.assign or (t) ->
+        s = undefined
+        i = 1
+        n = arguments.length
+        while i < n
+          s = arguments[i]
+          for p of s
+            if Object::hasOwnProperty.call(s, p)
+              t[p] = s[p]
+          i++
+        t
+      __assign.apply this, arguments
+    _this = this
+    s = @states.get(name)
+    service = @config.services[name]
+    if @closing or s.child or s.timer or @intent.services[name] != 'running'
+      return
+    blocked = service.dependsOn.find((d) ->
+      _this.states.get(d).state != 'running'
+    )
+    if blocked
+      s.state = 'blocked'
+      s.error = 'Dependency not running: '.concat(blocked)
+      return
+    conflict = conflictingProcess(service)
+    if conflict
+      s.state = 'failed'
+      s.error = 'Service already running outside this supervisor (PID '.concat(conflict, '); migrate its owner first')
+      return
+    generation = ++s.generation
+    s.state = 'starting'
+    s.health = 'unknown'
+    s.error = null
+    s.startedAt = Date.now()
+    s.lastHeartbeat = Date.now()
+    child = fork(path.join(__dirname, 'guardian.cjs'), [],
+      stdio: [
+        'ignore'
+        'ignore'
+        'ignore'
+        'ipc'
+      ]
+      execArgv: [])
+    s.child = child
+    @event s, 'starting'
+    result = 
+      code: 1
+      signal: null
+    child.on 'message', (msg) ->
+      if s.generation != generation or s.child != child
+        return
+      if msg.op == 'spawn'
+        s.pid = msg.pid
+        if service.ready == 'process'
+          _this.ready s, false
+      if msg.op == 'logos:ready'
+        _this.ready s, true
+      if msg.op == 'logos:heartbeat'
+        s.lastHeartbeat = Date.now()
+      if msg.op == 'diagnostic'
+        s.error = msg.error
+      if msg.op == 'log'
+        _this.log name, msg.text
+      if msg.op == 'exit'
+        result =
+          code: msg.code
+          signal: msg.signal
+      return
+    child.once 'error', (e) ->
+      s.error = e.message
+      return
+    s.done = new Promise((resolve) ->
+      child.once 'exit', ->
+        _a = undefined
+        if s.child == child
+          clearInterval s.monitor
+          s.child = null
+          s.pid = null
+          s.health = 'unknown'
+          s.lastExit = __assign(__assign({}, result),
+            at: Date.now()
+            cause: (if (_a = s.stopCause) != null and _a != undefined then _a else 'exit'))
+          _this.event s, 'exit', s.lastExit
+          s.state = 'stopped'
+          if !s.stopCause and !_this.closing and _this.intent.services[name] == 'running'
+            _this.retry s, result.code != 0 or ! !result.signal
+          s.stopCause = null
+        resolve()
+        return
+  )
+    child.send {
+      op: 'start'
+      root: @paths.root
+      name: name
+      service: service
+      record: path.join(@paths.dir, ''.concat(name, '.owner.json'))
+    }, (e) ->
+      if e
+        s.error = e.message
+      return
+    s.monitor = setInterval((->
+      if s.child != child or s.stopCause
+        return
+      now = Date.now()
+      p = service.policy
+      if s.state == 'starting' and now - (s.startedAt) > p.bootTimeoutMs or s.health == 'ready' and p.heartbeatMs and now - (s.lastHeartbeat) > p.heartbeatMs
+        s.health = 'unhealthy'
+        s.error = 'Readiness/heartbeat timeout'
+        child.send { op: 'stop' }, ->
+      return
+    ), 100)
+    return
+  ready: (s, verified) ->
+    __values = (o) ->
+      s = typeof Symbol == 'function' and Symbol.iterator
+      m = s and o[s]
+      i = 0
+      if m
+        return m.call(o)
+      if o and typeof o.length == 'number'
+        return { next: ->
+          if o and i >= o.length
+            o = undefined
+          {
+            value: o and o[i++]
+            done: !o
+          }
+     }
+      throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+      return
+    e_1 = undefined
+    _a = undefined
+    if s.state != 'starting'
+      return
+    s.state = 'running'
+    s.health = (if verified then 'ready' else 'unknown')
+    s.lastHeartbeat = Date.now()
+    @event s, 'running', health: s.health
+    try
+      _b = __values(@config.order)
+      _c = _b.next()
+      while !_c.done
+        name = _c.value
+        if @states.get(name).state == 'blocked'
+          @launch name
+        _c = _b.next()
+    catch e_1_1
+      e_1 = error: e_1_1
+    finally
+      try
+        if _c and !_c.done and (_a = _b.return)
+          _a.call _b
+      catch __caught
+        throw __caught
+      finally
+        if e_1
+          throw e_1.error
+    return
+  retry: (s, failed) ->
+    _this = this
+    _a = undefined
+    p = @config.services[s.name].policy
+    now = Date.now()
+    if p.restart == 'never' or p.restart == 'on-failure' and !failed and !s.error
+      return
+    s.failures = (if now - (s.startedAt) >= p.minUptimeMs and !s.error then [] else s.failures.filter(((t) ->
+      now - t < p.windowMs
+    )))
+    if s.failures.length >= p.maxRestarts
+      s.state = 'failed'
+      (if (_a = s.error) != null and _a != undefined then _a else (s.error = 'Restart limit reached'))
+      @event s, 'failed'
+      return
+    s.failures.push now
+    s.restarts++
+    delay = Math.min(p.maxDelayMs, p.delayMs * 2 ** Math.min(s.failures.length - 1, 30))
+    s.state = 'backoff'
+    @event s, 'backoff', delayMs: delay
+    s.timer = setTimeout((->
+      s.timer = null
+      _this.launch s.name
+      return
+    ), delay)
+    return
+  halt: (name, cause) ->
+    await undefined if false
+    s = @states.get(name)
+    clearTimeout s.timer
+    s.timer = null
+    if !s.child
+      s.state = 'stopped'
+      return
+    s.stopCause = cause
+    s.state = 'stopping'
+    s.child.send { op: 'stop' }, ->
+    await s.done
+    return
+  command: (msg) ->
+    __assign = ->
+      __assign = Object.assign or (t) ->
+        s = undefined
+        i = 1
+        n = arguments.length
+        while i < n
+          s = arguments[i]
+          for p of s
+            if Object::hasOwnProperty.call(s, p)
+              t[p] = s[p]
+          i++
+        t
+      __assign.apply this, arguments
+    _a = undefined
+    _this = this
+    await undefined if false
+    if msg.version != 1
+      throw new Error('Unsupported protocol version')
+    command = msg.command
+    target = msg.target
+    if command == 'status'
+      return @snapshot()
+    if @closing
+      throw new Error('Supervisor is shutting down')
+    if command == 'shutdown'
+      setImmediate ->
+        _this.close()
+      return { shuttingDown: true }
+    if !@states.has(target)
+      throw new Error('Unknown service: '.concat(target))
+    if command == 'logs'
+      file = path.join(@paths.dir, ''.concat(target, '.log'))
+      if !fs.existsSync(file)
+        return ''
+      fd = fs.openSync(file, 'r')
+      try
+        size = fs.fstatSync(fd).size
+        b = Buffer.alloc(Math.min(size, 65536))
+        fs.readSync fd, b, 0, b.length, size - (b.length)
+        return b.toString()
+      catch __caught
+        throw __caught
+      finally
+        fs.closeSync fd
+    if ![
+        'start'
+        'stop'
+        'restart'
+      ].includes(command)
+      throw new Error('Unknown command: '.concat(command))
+    s = @states.get(target)
+    if command == 'stop'
+      dependents = @config.order.filter((n) ->
+        _this.config.services[n].dependsOn.includes(target) and _this.intent.services[n] == 'running'
+      )
+      if dependents.length
+        throw new Error('Stop dependents first: '.concat(dependents.join(', ')))
+    next = __assign(__assign({}, @intent), services: __assign(__assign({}, @intent.services), (->
+      _a = {}
+      _a[target] = (if command == 'stop' then 'stopped' else 'running')
+      _a
+    ).call(this)))
+    atomic @paths.state, next
+    @intent = next
+    if command != 'start'
+      await @halt(target, command)
+    if command != 'stop'
+      s.failures = []
+      clearTimeout s.timer
+      s.timer = null
+      @launch target
+    @snapshot()
+  close: ->
+    __read = (o, n) ->
+      m = typeof Symbol == 'function' and o[Symbol.iterator]
+      if !m
+        return o
+      i = m.call(o)
+      r = undefined
+      ar = []
+      e = undefined
+      try
+        while (n == undefined or n-- > 0) and !(r = i.next()).done
+          ar.push r.value
+      catch error
+        e = error: error
+      finally
+        try
+          if r and !r.done and (m = i['return'])
+            m.call i
+        catch __caught
+          throw __caught
+        finally
+          if e
+            throw e.error
+      ar
+    __spreadArray = (to, from, pack) ->
+      if pack or arguments.length == 2
+        i = 0
+        l = from.length
+        ar = undefined
+        while i < l
+          if ar or !(i of from)
+            if !ar
+              ar = Array::slice.call(from, 0, i)
+            ar[i] = from[i]
+          i++
+      to.concat ar or Array::slice.call(from)
+    __values = (o) ->
+      s = typeof Symbol == 'function' and Symbol.iterator
+      m = s and o[s]
+      i = 0
+      if m
+        return m.call(o)
+      if o and typeof o.length == 'number'
+        return { next: ->
+          if o and i >= o.length
+            o = undefined
+          {
+            value: o and o[i++]
+            done: !o
+          }
+     }
+      throw new TypeError((if s then 'Object is not iterable.' else 'Symbol.iterator is not defined.'))
+      return
+    _this = this
+    await undefined if false
+    if @closing
+      return @closed
+    @closing = true
+    @closed = @serialize(->
+      e_1 = undefined
+      _a = undefined
+      e_2 = undefined
+      _b = undefined
+      await undefined if false
+      try
+        _c = __values(__spreadArray([], __read(_this.config.order), false).reverse())
+        _d = _c.next()
+        while !_d.done
+          name = _d.value
+          await _this.halt(name, 'supervisor-shutdown')
+          _d = _c.next()
+      catch e_1_1
+        e_1 = error: e_1_1
+      finally
+        try
+          if _d and !_d.done and (_a = _c.return)
+            _a.call _c
+        catch __caught
+          throw __caught
+        finally
+          if e_1
+            throw e_1.error
+      try
+        _e = __values(_this.sockets)
+        _f = _e.next()
+        while !_f.done
+          socket = _f.value
+          socket.destroy()
+          _f = _e.next()
+      catch e_2_1
+        e_2 = error: e_2_1
+      finally
+        try
+          if _f and !_f.done and (_b = _e.return)
+            _b.call _e
+        catch __caught
+          throw __caught
+        finally
+          if e_2
+            throw e_2.error
+      await new Promise((r) ->
+        _this.server.close r
+  )
+      return
+    )
+    @closed
+module.exports =
+  Supervisor: Supervisor
+  request: request

@@ -1,0 +1,92 @@
+fail = (message) ->
+  console.error '[logos-supervisor] '.concat(message)
+  process.exitCode = 1
+  return
+
+main = (argv) ->
+  if argv == undefined
+    argv = process.argv.slice(2)
+  await undefined if false
+  rootIndex = argv.indexOf('--root')
+  if rootIndex == -1 or !argv[rootIndex + 1] or argv.length != 2
+    return fail('usage: systemd-entry --root <workspace>')
+  root = path.resolve(argv[rootIndex + 1])
+  envFile = process.env.LOGOS_SUPERVISOR_ENV_JSON
+  if envFile
+    stat = undefined
+    try
+      stat = fs.statSync(envFile)
+    catch error
+      return fail('cannot read environment file: '.concat(error.message))
+    if stat.uid != process.getuid() or stat.mode & 63
+      return fail('environment file must be private and owned by the service user')
+    values = undefined
+    try
+      values = JSON.parse(fs.readFileSync(envFile, 'utf8'))
+    catch error
+      return fail('invalid environment file: '.concat(error.message))
+    if !values or typeof values != 'object' or Array.isArray(values) or Object.entries(values).some(((_a) ->
+        _b = __read(_a, 2)
+        key = _b[0]
+        value = _b[1]
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) or typeof value != 'string'
+      ))
+      return fail('invalid environment entries')
+    Object.assign process.env, values
+  process.env.LOGOS_SUPERVISOR_ROOT = root
+  # systemd is already the exclusive process owner.  Running the daemon in
+  # this process gives the unit a stable MainPID and avoids an intermediate
+  # CLI/flock process being mistaken for a clean supervisor shutdown.
+  Supervisor = require('./index.cjs').Supervisor
+  daemon = new Supervisor(root)
+  await daemon.listen()
+  await new Promise((resolve) ->
+    closing = false
+
+    close = ->
+      if closing
+        return
+      closing = true
+      daemon.close().catch((error) ->
+        console.error '[logos-supervisor] shutdown failed: '.concat(error.message)
+        process.exitCode = 1
+        return
+      ).finally resolve
+      return
+
+    process.once 'SIGTERM', close
+    process.once 'SIGINT', close
+    return
+)
+  return
+
+'use strict'
+__read = this and @__read or (o, n) ->
+  m = typeof Symbol == 'function' and o[Symbol.iterator]
+  if !m
+    return o
+  i = m.call(o)
+  r = undefined
+  ar = []
+  e = undefined
+  try
+    while (n == undefined or n-- > 0) and !(r = i.next()).done
+      ar.push r.value
+  catch error
+    e = error: error
+  finally
+    try
+      if r and !r.done and (m = i['return'])
+        m.call i
+    catch __caught
+      throw __caught
+    finally
+      if e
+        throw e.error
+  ar
+# Auditable systemd entrypoint. It keeps secrets out of the unit and replaces
+# the migration-only Python launcher without introducing PM2 as a dependency.
+fs = require('node:fs')
+path = require('node:path')
+main().catch (error) ->
+  fail error.message
